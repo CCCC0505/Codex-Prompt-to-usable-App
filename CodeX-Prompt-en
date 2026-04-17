@@ -1,0 +1,264 @@
+# Complete English Translation
+You are Codex GPT-5.4. Directly implement a runnable Windows 11 system tray voice input application in the current workspace. Do not only provide plans, do not leave critical TODOs, and do not use pseudo-code as a substitute. Prioritize "actually working, actually typing text, actually handling Chinese" before pursuing code aesthetics. For points that cannot be 100% reliably implemented in Windows user mode, you must implement a functional fallback and clearly document it in the README; do not pretend to have achieved perfection.
+
+Target Product: A Windows voice input application that resides in the system tray. Hold the hotkey to start recording; release to inject the recognized text into the currently focused input field. Defaults to Simplified Chinese recognition and supports menu-based language switching. When recording, an elegant, refined capsule overlay appears at the bottom-center of the screen, with a real-time volume-driven 5-bar waveform on the left and a live partial transcript on the right. After releasing the hotkey, if LLM refinement is enabled, perform extremely conservative error correction first, then inject the text.
+
+## I. Tech Stack & Project Constraints
+1. Use C# 12 + .NET 8 + WPF, targeting Windows 11 23H2+.
+2. The project must be a native Windows desktop application; do not use Electron, Tauri, MAUI, or WebView wrappers.
+3. Launch in system tray resident mode; no main window, no taskbar entry, no Alt+Tab entry.
+4. Use single-instance mode; repeated launches should activate the existing instance instead of spawning a second process.
+5. Recommended libraries (avoid over-reliance on fancy frameworks):
+   - `NAudio`: Microphone capture and real-time RMS
+   - `H.NotifyIcon.Wpf`: System tray icon
+   - `CommunityToolkit.Mvvm`: MVVM pattern
+   - `Whisper.net` or a viable .NET wrapper for `whisper.cpp`: Local multilingual speech recognition
+6. All critical features must have real implementations: global hotkeys, recording, partial transcript, overlay animations, clipboard injection, IME switching, LLM refine, settings persistence.
+7. Clean code structure with service-layer separation; do not place all logic in App.xaml.cs or a single massive Window.
+
+## II. Push-to-Talk & Recording Behavior
+1. Product-wise, prioritize "hold Fn to talk, release Fn to inject text".
+2. Face Windows reality: Fn is a firmware-level key on most machines; user-mode applications cannot reliably receive it via standard low-level keyboard hooks.
+3. Therefore, you must design as follows:
+   - Implement an abstract `IPushToTalkTrigger`.
+   - First attempt best-effort Fn detection (Raw Input / vendor scancode / observable low-level hook paths).
+   - If Fn cannot be reliably detected on the current machine, automatically fall back to a configurable, globally hookable, suppressible hotkey (default: `Right Ctrl`).
+   - The tray menu or settings UI must clearly display the currently active PTT key.
+4. When holding the active PTT key:
+   - Start recording
+   - Show overlay
+   - Start real-time partial transcript
+5. When releasing the PTT key:
+   - Stop recording
+   - Finalize full transcription
+   - If LLM refinement is enabled and configured, show `Refining...` and await result
+   - Finally inject text into the focused input field
+6. Suppress the active PTT key from propagating to the foreground application where possible, to avoid triggering host app shortcuts or input anomalies.
+7. Toggle-to-record (press once to start, press again to stop) is forbidden; must be hold-to-talk, release-to-finish.
+
+## III. Speech Recognition & Languages
+1. Default language must be Simplified Chinese; out-of-box Chinese recognition is mandatory.
+2. Provide language switching in the menu:
+   - English
+   - Simplified Chinese
+   - Traditional Chinese
+   - Japanese
+   - Korean
+3. Persist the current language selection; restore after app restart.
+4. Prioritize local multilingual Whisper for recognition backend because:
+   - Works offline without cloud dependency
+   - More stable for mixed Chinese-English
+   - Better for out-of-box desktop tools
+5. Do not embed large model files directly in the repo; implement a usable model management strategy:
+   - Preferred: Auto-download default multilingual model on first launch to `%LocalAppData%\<AppName>\Models`
+   - Alternative: Provide `scripts/download-model.ps1` + in-app missing prompt + one-click trigger
+   - Do not require users to manually follow documentation
+6. Must provide partial transcript during recognition, not only full result on release.
+7. Even if the underlying implementation uses incremental chunk decoding, the user must see continuously updating text.
+8. Special handling for mixed Chinese-English:
+   - Default language is `zh`
+   - Do not mistranscribe obvious English tech terms into Chinese homophones
+   - Partial / final transcript text stitching must be stable, not jittery
+
+## IV. Overlay UI (Critical – Do Not Make It Ugly)
+1. Display a borderless, non-activating, topmost, capsule-shaped overlay at bottom-center of the screen during recording.
+2. Implement with WPF custom borderless window, requirements:
+   - No title bar
+   - No system chrome / minimize/maximize/close buttons
+   - No taskbar entry
+   - No Alt+Tab entry
+   - Do not steal focus (no-activate)
+3. Visual style must be refined, similar to high-quality system HUD:
+   - Fixed height: 56px
+   - Corner radius: 28px
+   - Comfortable left/right padding inside capsule
+   - Use viable semi-transparent blur / acrylic / mica effect
+   - Subtle border and soft shadow
+4. Left side: 5-bar waveform area, fixed size 44x32px.
+5. The 5 bars **must** be driven by real-time audio RMS level; no fake hardcoded animations.
+6. Fixed bar weights:
+   - `[0.5, 0.8, 1.0, 0.75, 0.55]`
+   Natural center-high, side-low structure.
+7. Envelope smoothing:
+   - Attack: 40%
+   - Release: 15%
+8. Each bar has ±4% small random jitter for organic feel, but not chaotic jumping.
+9. Waveform amplitude must be large and clearly visible; grows loud when user speaks, falls when quiet.
+10. Right side: text label:
+    - Live partial transcript
+    - Show `Listening...` when empty
+    - Show `Refining...` during LLM refine
+11. Text area is flexible width:
+    - Min: 160px
+    - Max: 560px
+    - Smoothly expands with text
+12. Animation requirements:
+    - Entrance spring animation: 0.35s
+    - Text width smooth transition: 0.25s
+    - Exit scale fade: 0.22s
+13. Overlay position must handle multi-monitor and taskbar; show on primary display bottom-center with safe margin from screen edge.
+
+## V. Audio Capture & Waveform Calculation
+1. Record from system default microphone.
+2. Capture pipeline serves simultaneously:
+   - Real-time RMS calculation
+   - Partial transcript
+   - Final transcript
+3. RMS calculation must be stable, avoid excessive UI jitter.
+4. Recommended approach:
+   - Compute RMS in short frames
+   - Normalize
+   - Smooth via attack/release envelope
+   - Map to 5-bar heights
+5. Handle silence, device changes, unavailable mic, permission denied with clear tray notifications or status text.
+
+## VI. Text Injection, Clipboard & IME Switching
+1. Final text injection **must** use: backup clipboard → write text → simulate `Ctrl+V` → restore original clipboard.
+2. Do not attempt to simulate keyboard input character-by-character; unstable for Chinese and complex apps.
+3. Before injection, detect foreground window's input method / keyboard layout.
+4. If current IME or layout is CJK (Chinese/Japanese/Korean), temporarily switch to ASCII / US English keyboard layout (e.g., `00000409`), perform paste, then restore original IME/layout.
+5. Purpose: prevent foreground CJK IME from intercepting or corrupting `Ctrl+V`.
+6. Implement this logic **for real**; do not only write comments.
+7. Implementation guidance:
+   - Get foreground window handle
+   - Get its thread input language
+   - Check if LANGID / HKL is CJK
+   - If needed, send `WM_INPUTLANGCHANGEREQUEST` or equivalent to switch temporarily to English
+   - Use `SendInput` for `Ctrl+V`
+   - Restore original HKL after completion
+8. Clipboard restoration must be complete:
+   - At minimum reliable text restore
+   - Preserve common formats (Text / UnicodeText / Html / Rtf / Bitmap / FileDrop) preferred
+9. Retry briefly if clipboard is busy; do not fail on first lock.
+10. If injection fails, keep result on clipboard and notify user via tray toast.
+
+## VII. LLM Refinement
+1. Add an optional LLM refinement step after base speech recognition, for "extremely conservative fixing of obvious ASR errors", especially mixed Chinese-English and tech terms.
+2. Implement via OpenAI-compatible API, configuration:
+   - API Base URL
+   - API Key
+   - Model
+3. Provide `LLM Refinement` submenu in tray:
+   - Enable/disable toggle
+   - `Settings...` entry
+4. After releasing PTT, if LLM refinement is enabled and fully configured:
+   - Keep overlay visible
+   - Change status to `Refining...`
+   - Call LLM
+   - Use refined result as final injected text
+5. If LLM call fails, times out, or returns invalid:
+   - Automatically fall back to raw transcript
+   - Do not freeze the input flow
+6. API Key input must support full clear; save empty string as unconfigured; no "visually empty but control retains old value" bug.
+7. `Test` button must perform a real API call and clearly report success/failure.
+8. `Save` button must atomically persist config.
+9. Default timeout ~8 seconds to avoid long waits.
+10. LLM temperature near 0 for stable, conservative output.
+
+## VIII. LLM System Prompt (Built-In Directly, Do Not Weaken)
+Use the following core semantics for refinement; minor formatting allowed, but do not alter constraints:
+
+“You are an extremely conservative speech transcription corrector. Your only job is to fix obvious ASR/speech recognition errors.
+Only fix very obvious mistakes, such as:
+- Chinese wrong characters due to homophones
+- English tech terms incorrectly transliterated into Chinese, e.g., '佩森' → 'Python', '杰森' → 'JSON'
+- Obvious missing or wrong punctuation (only when 100% certain)
+
+**Never:**
+- Rewrite sentences
+- Polish wording
+- Delete correct-looking content
+- Add information not spoken
+- Translate content
+- Change tone or style
+- Arbitrarily compress or expand text
+
+If input looks correct, return it verbatim.
+Output only the final text itself; no explanations, no quotes, no Markdown, no prefixes/suffixes.”
+
+## IX. Settings & Persistence
+1. Use a dedicated settings service, save to `%LocalAppData%\<AppName>\settings.json`.
+2. Persist at minimum:
+   - Current language
+   - LLM refinement enabled
+   - API Base URL
+   - API Key
+   - Model
+   - PTT key mode (Fn experimental / fallback hotkey)
+   - Fallback hotkey
+3. Auto-load on startup; tray menu and settings window reflect current values correctly.
+4. Exception handling and atomic replacement on save to avoid corrupted config.
+
+## X. System Tray Menu
+1. Tray icon must be persistent.
+2. Menu includes at minimum:
+   - Current status (disabled item: e.g., `Ready` / `Recording...` / `Refining...`)
+   - Language submenu
+   - LLM Refinement submenu
+   - Push-to-talk / Hotkey status or settings entry
+   - Open Settings
+   - Quit
+3. Menu interactions reflect state changes instantly.
+
+## XI. Engineering Delivery Requirements
+1. Deliver a full buildable solution including:
+   - `.sln`
+   - Source projects
+   - Resource files
+   - `README.md`
+   - `Makefile`
+2. `Makefile` targets at minimum:
+   - `build`
+   - `run`
+   - `publish`
+   - `clean`
+   - `sign`
+3. `publish` outputs self-contained `win-x64` artifacts to `dist/`.
+4. `sign` uses `signtool` to sign executables; if no cert path/password in env, show clear message and skip; do not fake success.
+5. README must clearly document:
+   - How to build
+   - How to run
+   - Mic permission requirements
+   - Whisper model acquisition
+   - Fn limitations on Windows and fallback mechanism
+   - Known limitations
+6. No critical "implement later" placeholders in code.
+
+## XII. Implementation Quality Requirements
+1. UI must not look like a demo; restrained, refined, clean.
+2. Waveform must be visible, not faint.
+3. Animations smooth but not laggy.
+4. Errors have fallbacks and notifications; no silent failures.
+5. Do not skip partial transcript for convenience.
+6. Do not skip IME switching for convenience.
+7. Do not make LLM refine a pseudo-interface.
+8. Do not ignore "Fn unavailable"; implement real fallback.
+9. Prioritize maintainability: service separation, interface abstraction, clear naming, minimal necessary comments.
+10. Replace underlying libraries if unsuitable, but ensure final functionality is equivalent or more stable.
+
+## XIII. Recommended Module Structure
+Implement with this structure:
+- `App` / boot and single instance
+- `Tray` / tray menu and state
+- `Hotkey` / PTT trigger and global key listening
+- `Audio` / mic capture and RMS
+- `Transcription` / partial + final transcript
+- `Overlay` / overlay UI and animations
+- `Injection` / clipboard, IME, Ctrl+V
+- `LLM` / OpenAI-compatible refinement
+- `Settings` / persistence and settings window
+
+## XIV. Acceptance Criteria
+Ensure these verifiable behaviors:
+1. App goes to system tray on first launch; no main window, no taskbar icon.
+2. Default language: Simplified Chinese.
+3. Holding active PTT shows bottom capsule overlay and starts recording.
+4. 5-bar waveform visibly responds to voice volume; falls when silent.
+5. Partial transcript updates live on the right during recording.
+6. Release key → finish transcription → inject text to focused field.
+7. Reliable paste even when foreground is Chinese/Japanese/Korean IME, no interception.
+8. With LLM refinement enabled: shows `Refining...` on release, injects final text after return.
+9. Corrects obvious mistakes like "佩森" → "Python", "杰森" → "JSON"; leaves correct text unchanged.
+10. Language, LLM toggle, API config, hotkey config persist across restarts.
+
+Start implementation directly. Generate full project code, config, README, and Makefile. Do not output only plans. If you must make engineering tradeoffs under real constraints, document clearly in README, but code must remain runnable.
